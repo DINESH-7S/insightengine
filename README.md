@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A RAG app for asking questions across your PDFs and getting answers that cite the page they came from. I built it to see how retrieval behaves outside a notebook: ingestion, chunking, five retrieval strategies, and a way to measure them against each other. It combines a FastAPI backend, a Qdrant vector store and a Streamlit interface, and lets you compare five retrieval strategies side by side.
+A RAG app for asking questions across your PDFs and getting answers that cite the page they came from. I built it to see how retrieval behaves outside a notebook: ingestion, chunking, retrieval, and a way to measure the strategies against each other. It combines a FastAPI backend, a Qdrant vector store and a Streamlit interface, and lets you compare five retrieval strategies side by side.
 
 ![Chat view](docs/images/chat.png)
 
