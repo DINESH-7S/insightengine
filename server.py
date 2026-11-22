@@ -1,17 +1,19 @@
+import asyncio
+import hmac
 import logging
 import os
-import uuid
 import shutil
-import asyncio
-from typing import Dict, List, Optional, Any
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+import uuid
+from typing import Any, Dict, List, Optional
 
-from schemas import QueryRequest, QueryResponse, TaskStatusResponse
-from parser import DocumentParser, EmbeddingGenerator, MODEL_DIMENSIONS, DEFAULT_ENCODER
-from vector_db import QdrantEngine
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+
+from parser import DEFAULT_ENCODER, MODEL_DIMENSIONS, DocumentParser, EmbeddingGenerator
 from pipeline import RAGCoordinator
+from schemas import QueryRequest, QueryResponse, TaskStatusResponse
+from vector_db import QdrantEngine
 
 load_dotenv()
 
@@ -21,14 +23,27 @@ logger = logging.getLogger("RAGBackend")
 
 app = FastAPI(title="Insight RAG API Service")
 
-# Allow CORS for ease of integration
+# CORS: local Streamlit UI by default. Set CORS_ORIGINS (comma-separated) to change it.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://127.0.0.1:8501,http://localhost:8501").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "X-Admin-Token"],
 )
+
+# Destructive endpoints need X-Admin-Token when ADMIN_TOKEN is set.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+
+
+def require_admin(token: Optional[str]) -> None:
+    if ADMIN_TOKEN and not (token and hmac.compare_digest(token, ADMIN_TOKEN)):
+        raise HTTPException(status_code=401, detail="Missing or invalid admin token.")
 
 # In-memory background task status store
 tasks_status: Dict[str, Dict[str, Any]] = {}
@@ -49,10 +64,10 @@ async def background_ingest_worker(
                 "progress": 25.0,
                 "message": "Extracting text passages from document..."
             })
-            
+
             # Parse PDF
             segments = DocumentParser.parse_pdf(file_path, doc_id=doc_id)
-            
+
             if not segments:
                 tasks_status[task_id].update({
                     "status": "completed",
@@ -94,11 +109,12 @@ async def background_ingest_worker(
             })
         finally:
             # Remove temporary uploaded file
-            if os.path.exists(file_path):
-                try:
-                    os.unlink(file_path)
-                except Exception:
-                    pass
+            try:
+                os.unlink(file_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Could not remove %s", file_path, exc_info=True)
 
 @app.post("/api/documents/ingest", response_model=TaskStatusResponse)
 async def ingest_document(
@@ -115,14 +131,21 @@ async def ingest_document(
 
     # Ensure uploads directory exists
     os.makedirs("uploads", exist_ok=True)
-    
+
     task_id = str(uuid.uuid4())
     safe_filename = "".join(c for c in file.filename if c.isalnum() or c in (".", "-", "_"))
     temp_path = os.path.join("uploads", f"{task_id}-{safe_filename}")
 
     # Write file to disk temporarily
+    written = 0
     with open(temp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        while chunk := await file.read(1024 * 1024):
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                f.close()
+                os.unlink(temp_path)
+                raise HTTPException(status_code=413, detail="File too large.")
+            f.write(chunk)
 
     tasks_status[task_id] = {
         "task_id": task_id,
@@ -173,15 +196,18 @@ async def list_ingested_documents():
     return db_engine.list_documents()
 
 @app.delete("/api/database/wipe")
-async def wipe_database(embedding_model: str = DEFAULT_ENCODER):
+async def wipe_database(
+    embedding_model: str = DEFAULT_ENCODER,
+    x_admin_token: Optional[str] = Header(default=None),
+):
     """Clears uploaded logs, deletes temporary files, and wipes vector store."""
+    require_admin(x_admin_token)
     try:
         # Wipe Qdrant indexes
         dim = MODEL_DIMENSIONS.get(embedding_model, 384)
         db_engine = QdrantEngine(vector_dim=dim)
-        db_engine.collection_name = "docs"
         db_engine.reset_collection()
-        
+
         # Clean local storage
         uploads_dir = "uploads"
         if os.path.exists(uploads_dir):
@@ -192,12 +218,13 @@ async def wipe_database(embedding_model: str = DEFAULT_ENCODER):
                         os.unlink(filepath)
                     elif os.path.isdir(filepath):
                         shutil.rmtree(filepath)
-                except Exception:
-                    pass
-                    
+                except OSError:
+                    logger.warning("Could not remove %s", filepath, exc_info=True)
+
         # Reset background statuses
         tasks_status.clear()
-        
+
         return {"status": "success", "message": "Database and temporary storage successfully cleared."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reset database: {str(e)}")
+    except Exception:
+        logger.exception("Database wipe failed")
+        raise HTTPException(status_code=500, detail="Failed to reset database.") from None

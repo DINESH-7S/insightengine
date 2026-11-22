@@ -1,24 +1,28 @@
-import os
 import json
-import urllib.request
+import logging
+import os
 import urllib.parse
-from typing import List, Dict, Any, Optional
+import urllib.request
+from typing import Any, Dict, List, Optional
+
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
-from schemas import QueryResponse, ContextPassage, RAGSearchResult
-from parser import EmbeddingGenerator, MODEL_DIMENSIONS, DEFAULT_ENCODER
-from vector_db import QdrantEngine
-
-from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.retrievers import BaseRetriever
+from langchain_groq import ChatGroq
+from pydantic import ConfigDict
+
+from parser import DEFAULT_ENCODER, MODEL_DIMENSIONS, EmbeddingGenerator
+from schemas import ContextPassage, QueryResponse, RAGSearchResult
+from vector_db import QdrantEngine
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 groq_key = os.getenv("GROQ_API_KEY")
 
@@ -33,36 +37,33 @@ INSTRUCTIONS:
 {length_instruction}
 """
 
-def generate_queries(question: str, model_id: str = "llama-3.1-8b-instant") -> List[str]:
-    """Uses LLM to output variations of the search query to improve recall."""
-    if not groq_key:
-        return [question, f"Details about {question}", f"Overview of {question}"]
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
-        response = client.chat.completions.create(
-            model=model_id,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a search query rewriting expert. Produce 3 alternative versions of the user's question to retrieve relevant information. Return ONLY a valid JSON list of 3 strings."
-                },
-                {"role": "user", "content": question}
-            ],
-            temperature=0.3,
-            max_tokens=200,
-        )
-        data = response.choices[0].message.content.strip()
-        if data.startswith("```"):
-            data = data.split("```")[1].strip()
-            if data.startswith("json"):
-                data = data[4:].strip()
-        parsed = json.loads(data)
-        if isinstance(parsed, list):
-            return [str(item) for item in parsed] + [question]
-    except Exception:
-        pass
+def _static_variants(question: str) -> List[str]:
     return [question, f"Details about {question}", f"Overview of {question}"]
+
+
+def generate_queries(question: str, model_id: str = "llama-3.1-8b-instant") -> List[str]:
+    """Asks the LLM for alternative phrasings of the question to improve recall.
+
+    Falls back to simple templated variants if there is no API key or the call fails.
+    """
+    if not groq_key:
+        return _static_variants(question)
+    try:
+        llm = ChatGroq(api_key=groq_key, model_name=model_id, temperature=0.3, max_tokens=200)
+        reply = llm.invoke([
+            ("system", "You rewrite search queries. Produce 3 alternative versions of the user's "
+                       "question. Return ONLY a valid JSON list of 3 strings."),
+            ("user", question),
+        ])
+        data = str(reply.content).strip()
+        if data.startswith("```"):
+            data = data.split("```")[1].strip().removeprefix("json").strip()
+        parsed = json.loads(data)
+        if isinstance(parsed, list) and parsed:
+            return [question] + [str(item) for item in parsed[:3]]
+    except Exception:
+        logger.warning("Query expansion failed; using templated variants.", exc_info=True)
+    return _static_variants(question)
 
 def execute_duckduckgo_fallback(query: str) -> List[ContextPassage]:
     """Queries DuckDuckGo HTML search for external text snippets when local confidence is low."""
@@ -94,7 +95,7 @@ def execute_duckduckgo_fallback(query: str) -> List[ContextPassage]:
         if results:
             return results
     except Exception:
-        pass
+        logger.warning("DuckDuckGo fallback failed.", exc_info=True)
 
     return [
         ContextPassage(
@@ -118,13 +119,12 @@ class AdaptiveRAGRetriever(BaseRetriever):
     cached_results: Optional[RAGSearchResult] = None
     web_fallback_triggered: bool = False
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> List[Document]:
-        
+
         variant_vectors = None
         if self.strategy == "multi_query":
             variants = generate_queries(query)
@@ -277,6 +277,7 @@ class RAGCoordinator:
                 "length_instruction": length_instruction
             })
         except Exception as err:
+            logger.warning("Primary LLM failed (%s); trying backup model.", err)
             try:
                 # Use Llama 3.1 8b as backup LLM
                 fallback_llm = ChatGroq(
@@ -292,7 +293,8 @@ class RAGCoordinator:
                     "chat_history": memory,
                     "length_instruction": length_instruction
                 })
-            except Exception as b_err:
+            except Exception as backup_err:
+                logger.error("Primary LLM failed (%s); backup LLM failed (%s).", err, backup_err)
                 answer = f"⚠️ **Groq API Error:** {err}"
 
         # Re-map LangChain docs to ContextPassage list

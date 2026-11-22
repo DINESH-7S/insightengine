@@ -1,8 +1,10 @@
 import os
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
+
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+
 from schemas import TextSegment
 
 load_dotenv()
@@ -21,7 +23,7 @@ _model_registry = {}
 
 class DocumentParser:
     """Handles text extraction and chunk segmentation for PDF files."""
-    
+
     @staticmethod
     def parse_pdf(
         file_path: str,
@@ -40,19 +42,18 @@ class DocumentParser:
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap
         )
-        
+
         segments: List[TextSegment] = []
         seq_idx = 0
 
-        loader = PyPDFLoader(file_path)
-        pages = loader.load()
+        reader = PdfReader(file_path)
 
-        for idx, page in enumerate(pages):
-            text_content = page.page_content or ""
+        for idx, page in enumerate(reader.pages):
+            text_content = page.extract_text() or ""
             if not text_content.strip():
                 continue
 
-            page_num = page.metadata.get("page", idx) + 1
+            page_num = idx + 1
             chunks = splitter.split_text(text_content)
 
             for chunk in chunks:
@@ -71,7 +72,7 @@ class DocumentParser:
 
 class EmbeddingGenerator:
     """Thread-safe lazy loading container for SentenceTransformers models."""
-    
+
     @staticmethod
     def get_model(model_name: str):
         global _model_registry
@@ -86,7 +87,7 @@ class EmbeddingGenerator:
         """Converts a collection of strings into vector arrays."""
         if not texts:
             return []
-        
+
         transformer = cls.get_model(model_name)
         embeddings = transformer.encode(texts, show_progress_bar=False)
         return embeddings.tolist()

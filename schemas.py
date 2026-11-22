@@ -1,5 +1,7 @@
+from typing import Dict, List, Optional
+
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+
 
 class TextSegment(BaseModel):
     """Represents a chunked fragment of a document with source mapping."""
