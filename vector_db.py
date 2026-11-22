@@ -1,13 +1,20 @@
+import hashlib
+import logging
 import math
 import os
+import re
 import uuid
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+
 import numpy as np
-
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams, Filter, FilterSelector
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
-from schemas import TextSegment, RAGSearchResult, ContextPassage
+from schemas import ContextPassage, RAGSearchResult, TextSegment
+
+logger = logging.getLogger(__name__)
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 class LexicalScorerBM25:
     """Lightweight BM25 implementation for lexical relevance ranking."""
@@ -21,7 +28,8 @@ class LexicalScorerBM25:
         self.idf_map: Dict[str, float] = {}
 
     def _tokenize(self, text: str) -> List[str]:
-        return [word.lower() for word in text.split() if word.isalnum() or len(word) > 1]
+        # Lowercase alphanumeric tokens, so "Revenue," and "revenue" match.
+        return _TOKEN_RE.findall(text.lower())
 
     def fit(self, documents: List[str]):
         self.tokenized_corpus = [self._tokenize(doc) for doc in documents]
@@ -58,6 +66,16 @@ class LexicalScorerBM25:
 
         return scores
 
+def make_point_id(segment: TextSegment) -> str:
+    """Deterministic point ID, so re-ingesting a document overwrites instead of duplicating.
+
+    Python's built-in hash() is salted per process, so it cannot be used here.
+    """
+    digest = hashlib.sha1(segment.content.encode("utf-8")).hexdigest()
+    key = f"{segment.doc_id}:{segment.page_num}:{segment.seq_index}:{digest}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
 _qdrant_client_singleton: Optional[QdrantClient] = None
 _cross_encoder_registry = {}
 
@@ -66,22 +84,23 @@ def get_qdrant_client(url: Optional[str] = None, storage_path: str = "qdrant_sto
     global _qdrant_client_singleton
     if _qdrant_client_singleton is not None:
         return _qdrant_client_singleton
-    
+
     if url:
         _qdrant_client_singleton = QdrantClient(url=url, timeout=30)
     else:
         try:
             _qdrant_client_singleton = QdrantClient(path=storage_path)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Local Qdrant storage unavailable (%s); using in-memory store.", exc)
             _qdrant_client_singleton = QdrantClient(location=":memory:")
-            
+
     return _qdrant_client_singleton
 
 _active_collections: Set[str] = set()
 
 class QdrantEngine:
     """Handles communication with Qdrant and implements search dispatchers."""
-    
+
     def __init__(self, collection_name: str | None = None, vector_dim: int = 384):
         url = os.getenv("QDRANT_URL")
         storage_path = os.getenv("QDRANT_PATH", "qdrant_storage")
@@ -99,33 +118,19 @@ class QdrantEngine:
                         vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
                     )
             except Exception:
-                pass
+                logger.exception("Could not create Qdrant collection %r", self.collection)
+                raise
             _active_collections.add(self.collection)
 
     def reset_collection(self):
-        """Wipes the existing collection to reset indices."""
-        try:
-            if self.client.collection_exists(self.collection):
-                self.client.delete(
-                    collection_name=self.collection,
-                    points_selector=FilterSelector(filter=Filter())
-                )
-        except Exception:
-            pass
-
-        try:
-            if self.client.collection_exists(self.collection):
-                self.client.delete_collection(self.collection)
-        except Exception:
-            pass
-
-        try:
-            self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE),
-            )
-        except Exception:
-            pass
+        """Drops and recreates the collection."""
+        if self.client.collection_exists(self.collection):
+            self.client.delete_collection(self.collection)
+        self.client.create_collection(
+            collection_name=self.collection,
+            vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE),
+        )
+        _active_collections.add(self.collection)
 
     def store_segments(self, segments: List[TextSegment], vectors: List[List[float]]):
         """Persists segment text and dense vectors into Qdrant."""
@@ -136,13 +141,7 @@ class QdrantEngine:
 
         points = []
         for i, segment in enumerate(segments):
-            # Generate stable ID based on segment parameters
-            point_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"{segment.doc_id}:{segment.page_num}:{segment.seq_index}:{hash(segment.content)}"
-                )
-            )
+            point_id = make_point_id(segment)
             payload = {
                 "text": segment.content,
                 "source": segment.doc_id,
@@ -167,8 +166,8 @@ class QdrantEngine:
                 if record.payload and "source" in record.payload:
                     docs.add(record.payload["source"])
         except Exception:
-            pass
-        return list(docs)
+            logger.exception("Failed to list documents in %r", self.collection)
+        return sorted(docs)
 
     def _query(self, vector: List[float], limit: int = 5, retrieve_vectors: bool = False):
         if hasattr(self.client, "search"):
@@ -225,7 +224,9 @@ class QdrantEngine:
         if not pool:
             return []
 
-        pool_vecs = [np.array(p.vector) for p in pool if getattr(p, "vector", None) is not None]
+        # Keep hits and vectors aligned: drop any hit that came back without a vector.
+        pool = [p for p in pool if getattr(p, "vector", None) is not None]
+        pool_vecs = [np.array(p.vector) for p in pool]
         if not pool_vecs:
             return self.search_dense(vector, limit=limit)
 
@@ -289,7 +290,7 @@ class QdrantEngine:
             return []
 
         # Run BM25 on the dense retrieval pool
-        corpus = [getattr(h, "payload", {}).get("text", "") for h in dense_hits]
+        corpus = [(getattr(h, "payload", None) or {}).get("text", "") for h in dense_hits]
         bm25 = LexicalScorerBM25()
         bm25.fit(corpus)
         lexical_scores = bm25.score(query)
@@ -361,7 +362,7 @@ class QdrantEngine:
             if model_name not in _cross_encoder_registry:
                 from sentence_transformers import CrossEncoder
                 _cross_encoder_registry[model_name] = CrossEncoder(model_name)
-            
+
             reranker = _cross_encoder_registry[model_name]
             pairs = [[query, passage.content] for passage in dense_results]
             scores = reranker.predict(pairs)
@@ -372,6 +373,7 @@ class QdrantEngine:
             reranked_list = sorted(dense_results, key=lambda x: x.relevance_score, reverse=True)
             return reranked_list[:limit]
         except Exception:
+            logger.warning("Cross-encoder rerank failed; returning dense order.", exc_info=True)
             return dense_results[:limit]
 
     def search(
@@ -384,7 +386,7 @@ class QdrantEngine:
     ) -> RAGSearchResult:
         """Unified entry point to perform search across all supported strategies."""
         strategy = strategy.lower().strip()
-        
+
         if strategy == "mmr":
             passages = self.search_mmr(query_vector, limit=top_k)
         elif strategy == "hybrid":

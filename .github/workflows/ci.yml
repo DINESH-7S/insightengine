@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      # Tests stub the embedding model, so the heavy torch/sentence-transformers stack is not needed.
+      - name: Install test dependencies
+        run: |
+          pip install pytest ruff streamlit langchain langchain-core \
+            langchain-text-splitters langchain-groq qdrant-client pypdf beautifulsoup4 \
+            fastapi uvicorn httpx python-multipart pydantic python-dotenv numpy
+      - run: ruff check .
+      - run: pytest

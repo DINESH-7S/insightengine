@@ -1,10 +1,12 @@
+import os
 import time
-import streamlit as st
+
 import httpx
-from typing import List, Dict, Any
+import streamlit as st
 
 # API settings
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+ADMIN_HEADERS = {"X-Admin-Token": os.getenv("ADMIN_TOKEN", "")}
 
 st.set_page_config(
     page_title="InsightEngine | AI Document Analytics",
@@ -139,12 +141,19 @@ with st.sidebar:
 
     if st.button("Wipe database", use_container_width=True):
         try:
-            resp = httpx.delete(f"{API_BASE_URL}/api/database/wipe?embedding_model={selected_model}", timeout=30)
+            resp = httpx.delete(
+                f"{API_BASE_URL}/api/database/wipe",
+                params={"embedding_model": selected_model},
+                headers=ADMIN_HEADERS,
+                timeout=30,
+            )
             if resp.status_code == 200:
                 st.session_state.chat_history = []
                 st.session_state.registered_docs = []
                 st.success("Successfully reset database and logs.")
                 st.rerun()
+            elif resp.status_code == 401:
+                st.error("Wipe refused: set ADMIN_TOKEN for the dashboard to match the server.")
             else:
                 st.error("Failed to delete database indexes.")
         except Exception as e:
@@ -167,7 +176,7 @@ tab_chat, tab_ingest, tab_metrics = st.tabs(["Chat", "Upload and ingest", "Strat
 # Tab 1: Chat UI
 with tab_chat:
     st.subheader("Interactive QA Session")
-    
+
     # Draw existing messages
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
@@ -197,21 +206,21 @@ with tab_chat:
                     "enable_crag": use_web_fallback,
                     "answer_length": verbosity
                 }
-                
+
                 try:
                     resp = httpx.post(f"{API_BASE_URL}/api/query", json=payload, timeout=60)
                     if resp.status_code == 200:
                         result = resp.json()
-                        
+
                         # Display tags based on retrieval origin
                         if result.get("web_fallback_used", False):
                             st.markdown('<span class="tag-web">Web fallback used</span>', unsafe_allow_html=True)
                         else:
                             st.markdown(f'<span class="tag-local">Local retrieval ({search_strategy.upper()})</span>', unsafe_allow_html=True)
-                        
+
                         answer_text = result.get("answer", "")
                         st.markdown(answer_text)
-                        
+
                         passages = result.get("passages", [])
                         if passages:
                             with st.expander(f"Retrieved passages ({len(passages)})"):
@@ -221,7 +230,7 @@ with tab_chat:
                                     )
                                     st.caption(p["content"])
                                     st.divider()
-                                    
+
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "content": answer_text,
@@ -245,11 +254,11 @@ with tab_ingest:
                 st.write(f"### Processing: `{file_obj.name}`")
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
-                
+
                 # Send file upload request
                 files_payload = {"file": (file_obj.name, file_obj.getvalue(), "application/pdf")}
                 data_payload = {"embedding_model": selected_model}
-                
+
                 try:
                     resp = httpx.post(
                         f"{API_BASE_URL}/api/documents/ingest",
@@ -257,11 +266,11 @@ with tab_ingest:
                         data=data_payload,
                         timeout=30
                     )
-                    
+
                     if resp.status_code == 200:
                         task = resp.json()
                         task_id = task["task_id"]
-                        
+
                         # Poll status endpoint until completed/failed
                         while True:
                             status_resp = httpx.get(f"{API_BASE_URL}/api/documents/tasks/{task_id}")
@@ -270,10 +279,10 @@ with tab_ingest:
                                 status = current_task["status"]
                                 progress = current_task["progress"]
                                 msg = current_task["message"]
-                                
+
                                 progress_bar.progress(progress / 100.0)
                                 status_text.info(f"**Status:** {status.upper()} | {msg}")
-                                
+
                                 if status == "completed":
                                     st.success(f"Successfully processed `{file_obj.name}`!")
                                     break
@@ -288,7 +297,7 @@ with tab_ingest:
                         st.error(f"Failed to trigger ingestion: {resp.text}")
                 except Exception as e:
                     st.error(f"Error submitting file: {e}")
-            
+
             # Refresh doc list
             refresh_documents()
             st.rerun()
@@ -315,12 +324,12 @@ with tab_metrics:
                 ("BM25 Hybrid", "hybrid"),
                 ("Cross-Encoder Reranked", "reranker"),
             ]
-            
+
             columns = st.columns(4)
             for idx, (label, strategy_code) in enumerate(strategies):
                 with columns[idx]:
                     st.markdown(f"### {label}")
-                    
+
                     payload = {
                         "question": test_input,
                         "strategy": strategy_code,
@@ -330,7 +339,7 @@ with tab_metrics:
                         "enable_crag": False,
                         "answer_length": "Concise Summary"
                     }
-                    
+
                     try:
                         resp = httpx.post(f"{API_BASE_URL}/api/query", json=payload, timeout=30)
                         if resp.status_code == 200:
